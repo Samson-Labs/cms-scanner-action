@@ -1,0 +1,229 @@
+# CMS Theme Security Scan — GitHub Action
+#
+# Pulls a pre-built Docker image from ghcr.io and runs the scanner.
+# No source code is checked out or exposed — the image is a binary artifact.
+#
+# Usage:
+#   - uses: Samson-Labs/cms-scanner-action@v1
+#     with:
+#       theme-path: './wp-content/themes/my-theme'
+#
+# Supported profiles: quick, standard, a11y
+# (full/DAST profiles require Docker Compose — use the CLI instead)
+
+name: 'CMS Theme Security Scan'
+description: 'PHPCS/Psalm/Semgrep security and Pa11y accessibility scanning for WordPress and Drupal themes'
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  theme-path:
+    description: 'Path to theme/module directory (relative to repo root)'
+    required: true
+  profile:
+    description: 'Scan profile: quick, standard, or a11y'
+    default: 'quick'
+  cms:
+    description: 'CMS type: auto, wordpress, or drupal'
+    default: 'auto'
+  fail-on:
+    description: 'Severity threshold for non-zero exit: critical, high, medium, low, info, none'
+    default: 'none'
+  comment-on-pr:
+    description: 'Post scan summary comment on the PR'
+    default: 'true'
+  upload-sarif:
+    description: 'Upload SARIF to GitHub Code Scanning (requires security-events: write permission)'
+    default: 'true'
+  sarif-level:
+    description: 'Minimum severity for SARIF annotations (critical, high, medium, low, info). Empty = defer to .scanner.yml or default (medium).'
+    default: ''
+  scanner-version:
+    description: 'Docker image tag to use (e.g., latest, 0.3.0, edge)'
+    default: 'latest'
+  github-token:
+    description: 'GitHub token for posting PR comments'
+    default: ${{ github.token }}
+
+outputs:
+  total-findings:
+    description: 'Total number of active findings'
+    value: ${{ steps.scan.outputs.total }}
+  exit-code:
+    description: 'Scanner exit code (0=pass, 2=threshold exceeded)'
+    value: ${{ steps.scan.outputs.exit_code }}
+  report-path:
+    description: 'Path to the HTML report artifact'
+    value: ${{ steps.scan.outputs.report_path }}
+  results-json:
+    description: 'Path to scan_results.json'
+    value: ${{ steps.scan.outputs.results_json }}
+  sarif-path:
+    description: 'Path to the SARIF output file'
+    value: ${{ steps.scan.outputs.sarif_path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Pull scanner image
+      shell: bash
+      run: docker pull ghcr.io/samson-labs/cms-scanner:${{ inputs.scanner-version }}
+
+    - name: Run security scan
+      id: scan
+      shell: bash
+      run: |
+        set +e
+        OUTPUT_DIR="${{ runner.temp }}/scan-output"
+        mkdir -p "$OUTPUT_DIR"
+
+        # Resolve absolute theme path
+        THEME_PATH="${{ github.workspace }}/${{ inputs.theme-path }}"
+
+        # Build SARIF args
+        SARIF_ARGS="--sarif"
+        if [ -n "${{ inputs.sarif-level }}" ]; then
+          SARIF_ARGS="$SARIF_ARGS --sarif-level ${{ inputs.sarif-level }}"
+        fi
+
+        docker run --rm \
+          -v "$THEME_PATH":/scan/target:ro \
+          -v "$OUTPUT_DIR":/scan/output \
+          ghcr.io/samson-labs/cms-scanner:${{ inputs.scanner-version }} \
+          scan /scan/target \
+            --profile "${{ inputs.profile }}" \
+            --cms "${{ inputs.cms }}" \
+            --fail-on "${{ inputs.fail-on }}" \
+            $SARIF_ARGS \
+            --output /scan/output
+
+        EXIT_CODE=$?
+        set -e
+
+        echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+        echo "report_path=$OUTPUT_DIR/scan_report.html" >> "$GITHUB_OUTPUT"
+        echo "results_json=$OUTPUT_DIR/scan_results.json" >> "$GITHUB_OUTPUT"
+        echo "sarif_path=$OUTPUT_DIR/scan_results.sarif" >> "$GITHUB_OUTPUT"
+
+        # Extract total findings from JSON
+        if [ -f "$OUTPUT_DIR/scan_results.json" ]; then
+          TOTAL=$(python3 -c "import json; d=json.load(open('$OUTPUT_DIR/scan_results.json')); print(d['summary']['total'])" 2>/dev/null || echo "0")
+        else
+          TOTAL=0
+        fi
+        echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+
+        # Propagate failure exit code
+        if [ $EXIT_CODE -eq 2 ]; then
+          echo "::warning::Security scan found findings exceeding --fail-on ${{ inputs.fail-on }} threshold"
+        fi
+        exit $EXIT_CODE
+
+    - name: Upload HTML report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-scan-report
+        path: ${{ steps.scan.outputs.report_path }}
+        retention-days: 30
+        if-no-files-found: ignore
+
+    - name: Upload JSON results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-scan-results
+        path: ${{ steps.scan.outputs.results_json }}
+        retention-days: 30
+        if-no-files-found: ignore
+
+    - name: Upload SARIF to GitHub Code Scanning
+      if: >-
+        always() &&
+        inputs.upload-sarif == 'true'
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ steps.scan.outputs.sarif_path }}
+        category: cms-theme-scanner
+      continue-on-error: true
+
+    - name: Post PR comment
+      if: >-
+        always() &&
+        inputs.comment-on-pr == 'true' &&
+        (github.event_name == 'pull_request' || github.event_name == 'issue_comment')
+      uses: actions/github-script@v7
+      env:
+        RESULTS_JSON: ${{ steps.scan.outputs.results_json }}
+        EXIT_CODE: ${{ steps.scan.outputs.exit_code }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        PROFILE: ${{ inputs.profile }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs');
+          const MARKER = '<!-- samson-labs-theme-scanner -->';
+          const resultsPath = process.env.RESULTS_JSON;
+          const exitCode = parseInt(process.env.EXIT_CODE || '0', 10);
+          const failOn = process.env.FAIL_ON || 'none';
+          const profile = process.env.PROFILE || 'quick';
+
+          const prNumber = context.payload.pull_request?.number || context.payload.issue?.number;
+          if (!prNumber) return;
+
+          let body;
+          try {
+            const data = JSON.parse(fs.readFileSync(resultsPath, 'utf8'));
+            const summary = data.summary || {};
+            const bySeverity = summary.by_severity || {};
+            const total = summary.total || 0;
+            const status = exitCode === 2 ? 'FAIL' : 'PASS';
+            const emoji = exitCode === 2 ? '\u274c' : '\u2705';
+            const duration = data.scan_metadata?.elapsed_seconds
+              ? `${data.scan_metadata.elapsed_seconds}s` : 'N/A';
+
+            const sevRows = ['critical','high','medium','low','info']
+              .map(s => {
+                const c = bySeverity[s] || 0;
+                const icon = c > 0 && ['critical','high'].includes(s) ? ' \u26a0\ufe0f' : '';
+                return `| ${s.charAt(0).toUpperCase()+s.slice(1)} | ${c}${icon} |`;
+              }).join('\n');
+
+            const findings = (data.findings || []).filter(f => !f.false_positive).slice(0, 10);
+            let findingsTable = '';
+            if (findings.length > 0) {
+              const rows = findings.map((f, i) =>
+                `| ${i+1} | ${f.severity} | ${f.title} | \`${f.file_path||'-'}\` | ${f.line_number||'-'} |`
+              ).join('\n');
+              findingsTable = `\n<details><summary>Top findings</summary>\n\n| # | Severity | Title | File | Line |\n|---|----------|-------|------|------|\n${rows}\n\n</details>`;
+            }
+
+            const failNote = failOn !== 'none'
+              ? `Threshold: \`--fail-on ${failOn}\``
+              : 'Mode: advisory';
+
+            body = `${MARKER}\n## ${emoji} Security Scan: ${status}\n\n| Severity | Count |\n|----------|-------|\n${sevRows}\n\n**Total: ${total}** | Profile: ${profile} | Duration: ${duration} | ${failNote}${findingsTable}\n\n> *Powered by [Samson Labs CMS Scanner](https://github.com/Samson-Labs/cms-scanner-action)*`;
+          } catch (err) {
+            body = `${MARKER}\n## Security Scan Results\n\nScan completed. Check workflow artifacts for full report.`;
+          }
+
+          // Upsert: update existing comment or create new one
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner, repo: context.repo.repo,
+            issue_number: prNumber, per_page: 100
+          });
+          const existing = comments.find(c => c.body.includes(MARKER));
+          if (existing) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              comment_id: existing.id, body
+            });
+            core.info(`Updated existing comment #${existing.id}`);
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: prNumber, body
+            });
+            core.info('Created new PR comment');
+          }

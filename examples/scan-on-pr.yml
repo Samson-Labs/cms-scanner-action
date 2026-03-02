@@ -1,0 +1,84 @@
+# CMS theme security scan on Pull Requests.
+#
+# Triggers:
+#   1. Automatically on PRs that modify PHP or accessibility-related files
+#   2. Manually via /scan comment on a PR (supports: /scan [profile] [cms])
+#      Valid profiles: quick, standard, a11y
+#
+# Setup:
+#   1. Copy this file to .github/workflows/scan-on-pr.yml
+#   2. Change theme-path to your theme/module directory
+#   3. Commit and push — PRs will be scanned automatically.
+
+name: Security Scan
+
+on:
+  pull_request:
+    paths:
+      - '**.php'
+      - '**.module'
+      - '**.install'
+      - '**.theme'
+      - '**.inc'
+      - '**.html.twig'
+      - '**.css'
+  issue_comment:
+    types: [created]
+
+# Cancel in-flight scans for the same PR when new commits are pushed
+concurrency:
+  group: security-scan-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  security-events: write
+
+jobs:
+  scan:
+    name: Theme Security Scan
+    runs-on: ubuntu-latest
+
+    # Run on PR events, or on /scan comment (only on PRs, not plain issues)
+    if: >-
+      github.event_name == 'pull_request' ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '/scan')
+      )
+
+    steps:
+      - name: Parse /scan comment arguments
+        id: args
+        if: github.event_name == 'issue_comment'
+        shell: bash
+        run: |
+          COMMENT="${{ github.event.comment.body }}"
+          PROFILE=$(echo "$COMMENT" | awk '{print $2}')
+          CMS=$(echo "$COMMENT" | awk '{print $3}')
+          echo "profile=${PROFILE:-quick}" >> "$GITHUB_OUTPUT"
+          echo "cms=${CMS:-auto}" >> "$GITHUB_OUTPUT"
+
+      # For issue_comment events, checkout the PR branch (not default branch)
+      - name: Checkout PR branch
+        if: github.event_name == 'issue_comment'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.issue.number }}/head
+
+      - name: Checkout
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+
+      - name: Run security scan
+        uses: Samson-Labs/cms-scanner-action@v1
+        with:
+          # TODO: Change this to your theme/module directory path
+          theme-path: './wp-content/themes/my-theme'
+          profile: ${{ steps.args.outputs.profile || 'quick' }}
+          cms: ${{ steps.args.outputs.cms || 'auto' }}
+          fail-on: 'none'
+          comment-on-pr: 'true'
