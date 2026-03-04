@@ -124,28 +124,30 @@ runs:
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: security-scan-report
+        name: security-scan-report-${{ inputs.profile }}
         path: ${{ steps.scan.outputs.report_path }}
         retention-days: 30
         if-no-files-found: ignore
+        overwrite: true
 
     - name: Upload JSON results
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: security-scan-results
+        name: security-scan-results-${{ inputs.profile }}
         path: ${{ steps.scan.outputs.results_json }}
         retention-days: 30
         if-no-files-found: ignore
+        overwrite: true
 
     - name: Upload SARIF to GitHub Code Scanning
       if: >-
         always() &&
         inputs.upload-sarif == 'true'
-      uses: github/codeql-action/upload-sarif@v3
+      uses: github/codeql-action/upload-sarif@v4
       with:
         sarif_file: ${{ steps.scan.outputs.sarif_path }}
-        category: cms-theme-scanner
+        category: cms-theme-scanner-${{ inputs.profile }}
       continue-on-error: true
 
     - name: Post PR comment
