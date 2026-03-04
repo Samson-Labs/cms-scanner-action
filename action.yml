@@ -161,6 +161,9 @@ runs:
         EXIT_CODE: ${{ steps.scan.outputs.exit_code }}
         FAIL_ON: ${{ inputs.fail-on }}
         PROFILE: ${{ inputs.profile }}
+        RUN_ID: ${{ github.run_id }}
+        SERVER_URL: ${{ github.server_url }}
+        REPO: ${{ github.repository }}
       with:
         github-token: ${{ inputs.github-token }}
         script: |
@@ -170,6 +173,7 @@ runs:
           const exitCode = parseInt(process.env.EXIT_CODE || '0', 10);
           const failOn = process.env.FAIL_ON || 'none';
           const profile = process.env.PROFILE || 'quick';
+          const runUrl = `${process.env.SERVER_URL}/${process.env.REPO}/actions/runs/${process.env.RUN_ID}`;
 
           const prNumber = context.payload.pull_request?.number || context.payload.issue?.number;
           if (!prNumber) return;
@@ -182,8 +186,8 @@ runs:
             const total = summary.total || 0;
             const status = exitCode === 2 ? 'FAIL' : 'PASS';
             const emoji = exitCode === 2 ? '\u274c' : '\u2705';
-            const duration = data.scan_metadata?.elapsed_seconds
-              ? `${data.scan_metadata.elapsed_seconds}s` : 'N/A';
+            const duration = summary.elapsed_seconds
+              ? `${summary.elapsed_seconds}s` : 'N/A';
 
             const sevRows = ['critical','high','medium','low','info']
               .map(s => {
@@ -205,9 +209,9 @@ runs:
               ? `Threshold: \`--fail-on ${failOn}\``
               : 'Mode: advisory';
 
-            body = `${MARKER}\n## ${emoji} Security Scan: ${status}\n\n| Severity | Count |\n|----------|-------|\n${sevRows}\n\n**Total: ${total}** | Profile: ${profile} | Duration: ${duration} | ${failNote}${findingsTable}\n\n> *Powered by [Samson Labs CMS Scanner](https://github.com/Samson-Labs/cms-scanner-action)*`;
+            body = `${MARKER}\n## ${emoji} Security Scan: ${status}\n\n| Severity | Count |\n|----------|-------|\n${sevRows}\n\n**Total: ${total}** | Profile: ${profile} | Duration: ${duration} | ${failNote}${findingsTable}\n\n[View full report & artifacts](${runUrl}) | > *Powered by [Samson Labs CMS Scanner](https://github.com/Samson-Labs/cms-scanner-action)*`;
           } catch (err) {
-            body = `${MARKER}\n## Security Scan Results\n\nScan completed. Check workflow artifacts for full report.`;
+            body = `${MARKER}\n## Security Scan Results\n\nScan completed. [View workflow run](${runUrl}) for full report.`;
           }
 
           // Upsert: update existing comment or create new one
